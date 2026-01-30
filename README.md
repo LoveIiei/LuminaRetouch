@@ -32,7 +32,7 @@ LuminaRetouch provides a comprehensive suite of tools for detailed portrait enha
 ## Before & After
 | Original | Retouched with LuminaRetouch |
 | :---: | :---: |
-| ![Original](assets/before.jpg) | ![Retouched](assets/after.jpg) |
+| ![Original](assets/before.jpg) | ![Retouched](assets/after.png) |
 
 ---
 
