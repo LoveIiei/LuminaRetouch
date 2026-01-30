@@ -10,6 +10,19 @@ from dataclasses import dataclass
 
 from face_analyzer import get_face_analyzer, FaceLandmarks, LANDMARK_INDICES
 
+# Try to import AI enhancer
+try:
+    from ai_enhancer import (
+        check_gfpgan_available, enhance_face_ai, enhance_face_traditional,
+        remove_blemishes_ai, get_skin_mask
+    )
+    AI_AVAILABLE = check_gfpgan_available()
+except ImportError:
+    AI_AVAILABLE = False
+
+# Runtime flag for AI usage (set by pipeline)
+USE_AI_MODE = False
+
 
 @dataclass
 class ProcessingSettings:
@@ -65,7 +78,10 @@ class BaseProcessor:
 
 
 class SkinSmoothingProcessor(BaseProcessor):
-    """Frequency separation skin smoothing."""
+    """
+    Professional skin smoothing using AI (GFPGAN) or enhanced bilateral filtering.
+    Achieves natural, soft skin while preserving texture and details.
+    """
 
     def process(self, image: np.ndarray, strength: float,
                 landmarks: Optional[List[FaceLandmarks]] = None) -> np.ndarray:
@@ -79,72 +95,82 @@ class SkinSmoothingProcessor(BaseProcessor):
         result = image.copy()
         h, w = image.shape[:2]
 
+        # Try AI enhancement if Quality mode is selected and available
+        if USE_AI_MODE and AI_AVAILABLE and strength > 0.3:
+            try:
+                result = enhance_face_ai(result, strength * 0.7)
+            except Exception:
+                pass  # Fall through to traditional method
+
+        # Apply additional smoothing with masking for precise control
         for face in faces:
-            # Create skin mask (face oval minus eyes, lips)
-            mask = np.zeros((h, w), dtype=np.uint8)
-
-            if len(face.face_oval) >= 3:
-                cv2.fillPoly(mask, [face.face_oval.astype(np.int32)], 255)
-
-            # Exclude eyes
-            if len(face.left_eye) >= 3:
-                cv2.fillPoly(mask, [face.left_eye.astype(np.int32)], 0)
-            if len(face.right_eye) >= 3:
-                cv2.fillPoly(mask, [face.right_eye.astype(np.int32)], 0)
-
-            # Exclude eyebrows
-            if len(face.left_eyebrow) >= 3:
-                cv2.fillPoly(mask, [face.left_eyebrow.astype(np.int32)], 0)
-            if len(face.right_eyebrow) >= 3:
-                cv2.fillPoly(mask, [face.right_eyebrow.astype(np.int32)], 0)
-
-            # Exclude lips
-            if len(face.lips_outer) >= 3:
-                cv2.fillPoly(mask, [face.lips_outer.astype(np.int32)], 0)
-
-            # Feather mask
-            mask = cv2.GaussianBlur(mask, (21, 21), 0)
-
-            # Apply frequency separation
-            result = self._frequency_separation(result, mask, strength)
+            mask = self._create_skin_mask(face, h, w)
+            result = self._smooth_skin(result, mask, strength)
 
         return result
 
-    def _frequency_separation(self, image: np.ndarray, mask: np.ndarray,
-                              strength: float) -> np.ndarray:
-        """Apply frequency separation smoothing."""
-        img_float = image.astype(np.float32)
+    def _create_skin_mask(self, face: FaceLandmarks, h: int, w: int) -> np.ndarray:
+        """Create precise skin mask excluding eyes, lips, eyebrows."""
+        mask = np.zeros((h, w), dtype=np.uint8)
 
-        # Blur radius based on image size
-        blur_radius = max(3, int(min(image.shape[:2]) * 0.015))
-        if blur_radius % 2 == 0:
-            blur_radius += 1
+        if len(face.face_oval) >= 3:
+            cv2.fillPoly(mask, [face.face_oval.astype(np.int32)], 255)
 
-        # Low frequency (color/tone)
-        low_freq = cv2.GaussianBlur(img_float, (blur_radius, blur_radius), 0)
+        # Exclude facial features with expanded regions
+        exclude_regions = [
+            (face.left_eye, 1.4),
+            (face.right_eye, 1.4),
+            (face.left_eyebrow, 1.3),
+            (face.right_eyebrow, 1.3),
+            (face.lips_outer, 1.2),
+        ]
 
-        # High frequency (texture)
-        high_freq = img_float - low_freq + 128
+        for region, expand in exclude_regions:
+            if len(region) >= 3:
+                center = np.mean(region, axis=0)
+                expanded = ((region - center) * expand + center).astype(np.int32)
+                cv2.fillPoly(mask, [expanded], 0)
 
-        # Smooth low frequency more
-        smooth_radius = blur_radius * 2 + 1
-        low_freq_smooth = cv2.GaussianBlur(low_freq, (smooth_radius, smooth_radius), 0)
+        # Feather edges for smooth blending
+        mask = cv2.GaussianBlur(mask, (31, 31), 0)
+        return mask
 
-        # Blend
-        low_freq_blended = cv2.addWeighted(low_freq, 1 - strength, low_freq_smooth, strength, 0)
+    def _smooth_skin(self, image: np.ndarray, mask: np.ndarray, strength: float) -> np.ndarray:
+        """Apply professional skin smoothing using bilateral filtering."""
+        # Multi-pass bilateral filtering - preserves edges while smoothing
+        smoothed = image.copy()
 
-        # Recombine
-        result = low_freq_blended + high_freq - 128
+        # Parameters scale with strength
+        d = 9  # Diameter of pixel neighborhood
+        sigma_color = 50 + strength * 75  # Filter sigma in color space
+        sigma_space = 50 + strength * 75  # Filter sigma in coordinate space
 
-        # Apply mask
+        # Multiple passes for stronger effect
+        passes = max(1, int(strength * 4))
+        for _ in range(passes):
+            smoothed = cv2.bilateralFilter(smoothed, d, sigma_color, sigma_space)
+
+        # Apply surface blur effect (additional smoothing while preserving edges)
+        if strength > 0.5:
+            # Edge-preserving filter
+            smoothed = cv2.edgePreservingFilter(smoothed, flags=1, sigma_s=60, sigma_r=0.4 * strength)
+
+        # Blend with original using mask
         mask_float = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-        result = img_float * (1 - mask_float) + result * mask_float
 
+        # Control blend amount - never go 100% to preserve some natural texture
+        blend_strength = min(strength * 0.85, 0.95)
+        mask_float = mask_float * blend_strength
+
+        result = image.astype(np.float32) * (1 - mask_float) + smoothed.astype(np.float32) * mask_float
         return np.clip(result, 0, 255).astype(np.uint8)
 
 
 class BlemishRemovalProcessor(BaseProcessor):
-    """Remove blemishes/acne using inpainting."""
+    """
+    Professional blemish removal using AI-enhanced detection and inpainting.
+    Detects and removes acne, spots, redness, and skin discoloration.
+    """
 
     def process(self, image: np.ndarray, strength: float,
                 landmarks: Optional[List[FaceLandmarks]] = None) -> np.ndarray:
@@ -159,39 +185,113 @@ class BlemishRemovalProcessor(BaseProcessor):
         h, w = image.shape[:2]
 
         for face in faces:
-            # Create skin region mask
-            skin_mask = np.zeros((h, w), dtype=np.uint8)
-            if len(face.face_oval) >= 3:
-                cv2.fillPoly(skin_mask, [face.face_oval.astype(np.int32)], 255)
+            # Create comprehensive skin mask
+            skin_mask = self._create_skin_mask(face, h, w)
 
-            # Exclude eyes, lips, eyebrows
-            for region in [face.left_eye, face.right_eye, face.lips_outer,
-                          face.left_eyebrow, face.right_eyebrow]:
-                if len(region) >= 3:
-                    cv2.fillPoly(skin_mask, [region.astype(np.int32)], 0)
+            # Detect blemishes using multiple methods
+            blemish_mask = self._detect_blemishes(result, skin_mask, strength)
 
-            # Detect blemishes (dark spots that contrast with surrounding skin)
-            gray = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
-
-            # Adaptive threshold to find spots
-            blur = cv2.GaussianBlur(gray, (15, 15), 0)
-            diff = cv2.absdiff(gray, blur)
-
-            # Threshold based on strength
-            thresh_val = int(20 - strength * 10)  # Lower = more sensitive
-            _, blemish_mask = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
-
-            # Only in skin region
-            blemish_mask = cv2.bitwise_and(blemish_mask, skin_mask)
-
-            # Dilate slightly for better inpainting
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            blemish_mask = cv2.dilate(blemish_mask, kernel, iterations=1)
-
-            # Inpaint
+            # Remove blemishes using high-quality inpainting
             if np.sum(blemish_mask) > 0:
-                result = cv2.inpaint(result, blemish_mask, 3, cv2.INPAINT_TELEA)
+                result = self._remove_blemishes(result, blemish_mask)
 
+        return result
+
+    def _create_skin_mask(self, face: FaceLandmarks, h: int, w: int) -> np.ndarray:
+        """Create skin region mask."""
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        if len(face.face_oval) >= 3:
+            cv2.fillPoly(mask, [face.face_oval.astype(np.int32)], 255)
+
+        # Exclude eyes, lips, eyebrows with expansion
+        for region in [face.left_eye, face.right_eye, face.lips_outer,
+                       face.left_eyebrow, face.right_eyebrow]:
+            if len(region) >= 3:
+                center = np.mean(region, axis=0)
+                expanded = ((region - center) * 1.3 + center).astype(np.int32)
+                cv2.fillPoly(mask, [expanded], 0)
+
+        return mask
+
+    def _detect_blemishes(self, image: np.ndarray, skin_mask: np.ndarray,
+                          strength: float) -> np.ndarray:
+        """Multi-method blemish detection."""
+        h, w = image.shape[:2]
+        blemish_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Convert to different color spaces for comprehensive detection
+        lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+        l_channel = lab[:, :, 0]
+        a_channel = lab[:, :, 1]
+        b_channel = lab[:, :, 2]
+
+        # Adaptive blur size based on image
+        blur_size = max(15, int(min(h, w) * 0.02))
+        if blur_size % 2 == 0:
+            blur_size += 1
+
+        # 1. Dark spots (lower L than surrounding)
+        l_blur = cv2.GaussianBlur(l_channel, (blur_size, blur_size), 0)
+        dark_diff = l_blur - l_channel
+        dark_thresh = 10 - strength * 6
+        dark_spots = (dark_diff > dark_thresh).astype(np.uint8) * 255
+        blemish_mask = cv2.bitwise_or(blemish_mask, dark_spots)
+
+        # 2. Bright spots (higher L than surrounding)
+        bright_diff = l_channel - l_blur
+        bright_thresh = 12 - strength * 6
+        bright_spots = (bright_diff > bright_thresh).astype(np.uint8) * 255
+        blemish_mask = cv2.bitwise_or(blemish_mask, bright_spots)
+
+        # 3. Redness detection (high 'a' channel)
+        a_blur = cv2.GaussianBlur(a_channel, (blur_size, blur_size), 0)
+        red_diff = a_channel - a_blur
+        red_thresh = 6 - strength * 3
+        red_spots = (red_diff > red_thresh).astype(np.uint8) * 255
+        blemish_mask = cv2.bitwise_or(blemish_mask, red_spots)
+
+        # 4. Yellow/brown spots (b channel deviation)
+        b_blur = cv2.GaussianBlur(b_channel, (blur_size, blur_size), 0)
+        b_diff = np.abs(b_channel - b_blur)
+        brown_thresh = 8 - strength * 4
+        brown_spots = (b_diff > brown_thresh).astype(np.uint8) * 255
+        blemish_mask = cv2.bitwise_or(blemish_mask, brown_spots)
+
+        # 5. Texture anomalies (high local variance)
+        gray_blur = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+        texture_diff = cv2.absdiff(gray, gray_blur)
+        texture_thresh = 18 - strength * 10
+        texture_spots = cv2.threshold(texture_diff, texture_thresh, 255, cv2.THRESH_BINARY)[1]
+        blemish_mask = cv2.bitwise_or(blemish_mask, texture_spots)
+
+        # Only in skin region
+        blemish_mask = cv2.bitwise_and(blemish_mask, skin_mask)
+
+        # Clean up mask
+        # Remove noise
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        blemish_mask = cv2.morphologyEx(blemish_mask, cv2.MORPH_OPEN, kernel_open)
+
+        # Remove very large regions (not blemishes, might be features)
+        contours, _ = cv2.findContours(blemish_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        max_area = (min(h, w) * 0.025) ** 2
+        for cnt in contours:
+            if cv2.contourArea(cnt) > max_area:
+                cv2.drawContours(blemish_mask, [cnt], -1, 0, -1)
+
+        # Dilate for better inpainting coverage
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        blemish_mask = cv2.dilate(blemish_mask, kernel_dilate, iterations=1)
+
+        return blemish_mask
+
+    def _remove_blemishes(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Remove blemishes using high-quality inpainting."""
+        # Use Navier-Stokes based inpainting for better results
+        result = cv2.inpaint(image, mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
         return result
 
 
@@ -243,7 +343,7 @@ class EyeBrightnessProcessor(BaseProcessor):
 
 
 class EyeSizeProcessor(BaseProcessor):
-    """Enlarge eyes using warping."""
+    """Enlarge eyes using warping with iris-aware algorithm."""
 
     def process(self, image: np.ndarray, strength: float,
                 landmarks: Optional[List[FaceLandmarks]] = None) -> np.ndarray:
@@ -257,18 +357,38 @@ class EyeSizeProcessor(BaseProcessor):
         result = image.copy()
 
         for face in faces:
-            # Enlarge each eye
-            for eye_center in [face.left_eye_center, face.right_eye_center]:
+            # Get eye regions for more natural warping
+            eye_data = [
+                (face.left_eye_center, face.left_eye, face.left_iris),
+                (face.right_eye_center, face.right_eye, face.right_iris)
+            ]
+
+            for eye_center, eye_contour, iris in eye_data:
                 if eye_center != (0, 0):
-                    result = self._enlarge_region(result, eye_center, strength * 0.15)
+                    # Calculate eye-specific radius based on actual eye size
+                    if len(eye_contour) > 0:
+                        eye_width = np.max(eye_contour[:, 0]) - np.min(eye_contour[:, 0])
+                        eye_height = np.max(eye_contour[:, 1]) - np.min(eye_contour[:, 1])
+                        radius = int(max(eye_width, eye_height) * 0.8)
+                    else:
+                        radius = int(min(image.shape[:2]) * 0.05)
+
+                    # Get iris center if available for more natural enlargement
+                    if len(iris) >= 3:
+                        iris_center = tuple(np.mean(iris, axis=0).astype(int))
+                    else:
+                        iris_center = eye_center
+
+                    # Limit strength to avoid unrealistic distortion
+                    effective_strength = min(strength * 0.12, 0.15)
+                    result = self._enlarge_region(result, iris_center, effective_strength, radius)
 
         return result
 
     def _enlarge_region(self, image: np.ndarray, center: Tuple[int, int],
-                        strength: float) -> np.ndarray:
-        """Enlarge a circular region (bulge effect)."""
+                        strength: float, radius: int) -> np.ndarray:
+        """Enlarge a circular region with smooth falloff."""
         h, w = image.shape[:2]
-        radius = int(min(h, w) * 0.08)
 
         # Create coordinate grids
         y, x = np.ogrid[:h, :w]
@@ -278,28 +398,30 @@ class EyeSizeProcessor(BaseProcessor):
         dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
 
         # Normalized distance (0 at center, 1 at radius)
-        norm_dist = dist / radius
-        norm_dist = np.clip(norm_dist, 0, 1)
+        norm_dist = np.clip(dist / radius, 0, 1)
 
-        # Bulge factor (stronger at center)
-        factor = 1 - (1 - norm_dist ** 2) * strength
+        # Use smoother cubic falloff for more natural look
+        # This preserves more detail at the center (iris) while expanding outer regions
+        falloff = (1 - norm_dist ** 3) ** 2
+        factor = 1 - falloff * strength
 
-        # Only affect pixels within radius
-        mask = dist < radius
+        # Smooth transition at edge to avoid artifacts
+        edge_blend = np.clip((radius - dist) / (radius * 0.2), 0, 1)
+        factor = factor * edge_blend + 1 * (1 - edge_blend)
 
         # Calculate new coordinates
-        new_x = cx + (x - cx) * np.where(mask, factor, 1)
-        new_y = cy + (y - cy) * np.where(mask, factor, 1)
+        new_x = cx + (x - cx) * factor
+        new_y = cy + (y - cy) * factor
 
-        # Remap
+        # Remap with cubic interpolation for better quality
         map_x = new_x.astype(np.float32)
         map_y = new_y.astype(np.float32)
 
-        return cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        return cv2.remap(image, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
 
 
 class DarkCircleRemovalProcessor(BaseProcessor):
-    """Remove dark circles under eyes."""
+    """Remove dark circles under eyes with subtle, natural blending."""
 
     def process(self, image: np.ndarray, strength: float,
                 landmarks: Optional[List[FaceLandmarks]] = None) -> np.ndarray:
@@ -314,42 +436,56 @@ class DarkCircleRemovalProcessor(BaseProcessor):
         h, w = image.shape[:2]
 
         for face in faces:
-            # Get under-eye regions
             under_eye_mask = np.zeros((h, w), dtype=np.uint8)
 
-            # Create under-eye regions manually from eye landmarks
+            # Create under-eye regions from eye landmarks
             for eye in [face.left_eye, face.right_eye]:
                 if len(eye) >= 3:
-                    # Get bottom half of eye region, extended down
                     eye_center = np.mean(eye, axis=0)
                     eye_bottom = eye[eye[:, 1] > eye_center[1]]
 
                     if len(eye_bottom) >= 2:
-                        # Create under-eye polygon
-                        offset = int(min(h, w) * 0.02)
+                        # Smaller, more focused under-eye region
+                        offset = int(min(h, w) * 0.015)
                         under_eye = eye_bottom.copy()
-                        under_eye[:, 1] += offset  # Shift down
+                        under_eye[:, 1] += offset
 
-                        # Add points to close polygon
                         points = np.vstack([eye_bottom, under_eye[::-1]])
                         cv2.fillPoly(under_eye_mask, [points.astype(np.int32)], 255)
 
-            # Feather mask
-            under_eye_mask = cv2.GaussianBlur(under_eye_mask, (21, 21), 0)
-            mask_float = (under_eye_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+            if np.sum(under_eye_mask) == 0:
+                continue
 
-            # Color correct: reduce blue/purple, brighten
+            # Heavy feathering for smooth blending (larger kernel)
+            under_eye_mask = cv2.GaussianBlur(under_eye_mask, (31, 31), 0)
+            mask_float = under_eye_mask.astype(np.float32) / 255.0
+
+            # Convert to LAB for color correction
             lab = cv2.cvtColor(result, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-            # Increase L (lightness)
-            lab[:, :, 0] = np.clip(lab[:, :, 0] + 15 * strength, 0, 255)
-            # Reduce blue (increase b)
-            lab[:, :, 2] = np.clip(lab[:, :, 2] + 8 * strength, 0, 255)
-            # Reduce purple/red slightly (reduce a)
-            lab[:, :, 1] = np.clip(lab[:, :, 1] - 3 * strength, 0, 255)
+            # Subtle, conservative corrections
+            # Only slightly brighten and reduce blue/purple tint
+            effective_strength = strength * 0.4  # Reduce overall effect
+
+            # Gentle lightness boost (max +8 at full strength)
+            lab[:, :, 0] = np.clip(
+                lab[:, :, 0] + 8 * effective_strength * mask_float, 0, 255)
+
+            # Very subtle color correction
+            # Reduce blue tint (increase b slightly)
+            lab[:, :, 2] = np.clip(
+                lab[:, :, 2] + 4 * effective_strength * mask_float, 0, 255)
+
+            # Minimal red adjustment
+            lab[:, :, 1] = np.clip(
+                lab[:, :, 1] - 2 * effective_strength * mask_float, 0, 255)
 
             corrected = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-            result = (result * (1 - mask_float) + corrected * mask_float).astype(np.uint8)
+
+            # Blend with reduced opacity for more natural look
+            blend_strength = mask_float * 0.7  # Never fully replace original
+            mask_3d = blend_strength[:, :, np.newaxis]
+            result = (result * (1 - mask_3d) + corrected * mask_3d).astype(np.uint8)
 
         return result
 
@@ -500,38 +636,48 @@ class FaceSlimmingProcessor(BaseProcessor):
             return image
 
         result = image.copy()
+        h, w = image.shape[:2]
 
         for face in faces:
-            # Warp cheeks toward center
+            # Collect all warp points first, then apply once
+            warp_points = []
             center = face.face_center
+            radius = int(min(h, w) * 0.1)
 
             # Left cheek points
             left_cheek = face.points[LANDMARK_INDICES['left_cheek']]
-            for point in left_cheek[::2]:  # Every other point
-                result = self._warp_toward(result, tuple(point), center, strength * 0.08)
+            for point in left_cheek[::2]:
+                warp_points.append((tuple(point), center, strength * 0.08))
 
             # Right cheek points
             right_cheek = face.points[LANDMARK_INDICES['right_cheek']]
             for point in right_cheek[::2]:
-                result = self._warp_toward(result, tuple(point), center, strength * 0.08)
+                warp_points.append((tuple(point), center, strength * 0.08))
+
+            # Apply all warps in single remap
+            result = self._batch_warp(result, warp_points, radius)
 
         return result
 
-    def _warp_toward(self, image: np.ndarray, src: Tuple[int, int],
-                     dst: Tuple[int, int], strength: float) -> np.ndarray:
-        """Warp region toward destination."""
+    def _batch_warp(self, image: np.ndarray, warp_points: List[Tuple],
+                    radius: int) -> np.ndarray:
+        """Apply multiple warps in a single remap operation."""
         h, w = image.shape[:2]
-        radius = int(min(h, w) * 0.1)
-
         y, x = np.mgrid[:h, :w]
-        dist = np.sqrt((x - src[0]) ** 2 + (y - src[1]) ** 2)
-        falloff = np.maximum(0, 1 - dist / radius) ** 2
 
-        dx = (dst[0] - src[0]) * strength * falloff
-        dy = (dst[1] - src[1]) * strength * falloff
+        # Accumulate displacements
+        total_dx = np.zeros((h, w), dtype=np.float32)
+        total_dy = np.zeros((h, w), dtype=np.float32)
 
-        map_x = (x - dx).astype(np.float32)
-        map_y = (y - dy).astype(np.float32)
+        for src, dst, strength in warp_points:
+            dist = np.sqrt((x - src[0]) ** 2 + (y - src[1]) ** 2)
+            falloff = np.maximum(0, 1 - dist / radius) ** 2
+
+            total_dx += (dst[0] - src[0]) * strength * falloff
+            total_dy += (dst[1] - src[1]) * strength * falloff
+
+        map_x = (x - total_dx).astype(np.float32)
+        map_y = (y - total_dy).astype(np.float32)
 
         return cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
@@ -647,20 +793,21 @@ class JawlineSharpenProcessor(BaseProcessor):
             return image
 
         result = image.copy()
+        h, w = image.shape[:2]
 
         for face in faces:
-            # Warp jawline points inward/upward
+            warp_points = []
             face_center = face.face_center
+            radius = int(min(h, w) * 0.06)
 
             # Left jawline
             left_jaw = face.points[LANDMARK_INDICES['jawline_left']]
             for point in left_jaw[::2]:
-                # Move toward center and up
                 dst = (
                     int(point[0] + (face_center[0] - point[0]) * 0.05),
                     int(point[1] - 3)
                 )
-                result = self._local_warp(result, tuple(point), dst, strength * 0.3)
+                warp_points.append((tuple(point), dst, strength * 0.3))
 
             # Right jawline
             right_jaw = face.points[LANDMARK_INDICES['jawline_right']]
@@ -669,25 +816,31 @@ class JawlineSharpenProcessor(BaseProcessor):
                     int(point[0] + (face_center[0] - point[0]) * 0.05),
                     int(point[1] - 3)
                 )
-                result = self._local_warp(result, tuple(point), dst, strength * 0.3)
+                warp_points.append((tuple(point), dst, strength * 0.3))
+
+            # Apply all warps in single remap
+            result = self._batch_warp(result, warp_points, radius)
 
         return result
 
-    def _local_warp(self, image: np.ndarray, src: Tuple[int, int],
-                    dst: Tuple[int, int], strength: float) -> np.ndarray:
-        """Apply local warping."""
+    def _batch_warp(self, image: np.ndarray, warp_points: List[Tuple],
+                    radius: int) -> np.ndarray:
+        """Apply multiple warps in a single remap operation."""
         h, w = image.shape[:2]
-        radius = int(min(h, w) * 0.06)
-
         y, x = np.mgrid[:h, :w]
-        dist = np.sqrt((x - src[0]) ** 2 + (y - src[1]) ** 2)
-        falloff = np.maximum(0, 1 - dist / radius) ** 2
 
-        dx = (dst[0] - src[0]) * strength * falloff
-        dy = (dst[1] - src[1]) * strength * falloff
+        total_dx = np.zeros((h, w), dtype=np.float32)
+        total_dy = np.zeros((h, w), dtype=np.float32)
 
-        map_x = (x - dx).astype(np.float32)
-        map_y = (y - dy).astype(np.float32)
+        for src, dst, strength in warp_points:
+            dist = np.sqrt((x - src[0]) ** 2 + (y - src[1]) ** 2)
+            falloff = np.maximum(0, 1 - dist / radius) ** 2
+
+            total_dx += (dst[0] - src[0]) * strength * falloff
+            total_dy += (dst[1] - src[1]) * strength * falloff
+
+        map_x = (x - total_dx).astype(np.float32)
+        map_y = (y - total_dy).astype(np.float32)
 
         return cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
@@ -776,7 +929,7 @@ class RetouchPipeline:
         }
 
     def process(self, image: np.ndarray, settings: ProcessingSettings,
-                progress_callback=None) -> np.ndarray:
+                progress_callback=None, use_ai: bool = False) -> np.ndarray:
         """
         Process image through the full retouching pipeline.
 
@@ -784,11 +937,16 @@ class RetouchPipeline:
             image: Input RGB image
             settings: Processing settings
             progress_callback: Optional callback(step_name, progress_percent)
+            use_ai: Whether to use AI enhancement (Quality mode)
 
         Returns:
             Processed image
         """
         result = image.copy()
+
+        # Set global AI mode flag for processors
+        global USE_AI_MODE
+        USE_AI_MODE = use_ai
 
         # Analyze face once (cached)
         landmarks = self.analyzer.analyze(result)
@@ -827,10 +985,6 @@ class RetouchPipeline:
                 processor = self.processors.get(step_name)
                 if processor:
                     result = processor.process(result, strength, landmarks)
-
-                # Re-analyze if face shape changed (for subsequent shape processors)
-                if step_name in ['face_slimming', 'nose_slimming', 'chin_adjustment']:
-                    landmarks = self.analyzer.analyze(result, force=True)
 
                 current_step += 1
 

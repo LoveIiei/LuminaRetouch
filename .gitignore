@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.nox/
+.tox/
+
+# Virtual Environment
+.venv/
+env/
+venv/
+build/
+dist/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# LuminaRetouch Specific
+# AI Model Weights (large files, downloaded on demand)
+models/*.pth
+models/*/*.pth
+models/*/*/*.pth
+frontend-design.md
+
+# Cache directories
+cache/
+
+# User-specific configuration
+config.json
+
+# Log files
+*.log
+
+# Output images or temporary files
+*processed*
+*_edit.png
+gfpgan/weights/detection_Resnet50_Final.pth
+gfpgan/weights/parsing_parsenet.pth
+__pycache__/main_window.cpython-311.pyc
+__pycache__/processors.cpython-311.pyc

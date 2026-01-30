@@ -1,5 +1,5 @@
 # LuminaRetouch Dependencies
-# Portrait beautification app - NO external AI models required for core features!
+# Professional Portrait Retouching Application
 
 # ============ REQUIRED (Core functionality) ============
 
@@ -7,18 +7,31 @@
 PySide6>=6.5.0
 
 # Image Processing
-numpy==1.26.4
-opencv-python==4.10.0.84
+numpy>=1.24.0
+opencv-python>=4.8.0
 
-# Face Detection & Landmarks (auto-downloads lightweight models)
-mediapipe==0.10.21
+# Face Detection & Landmarks
+mediapipe>=0.10.0
 
-# ============ OPTIONAL (Advanced features) ============
+# ============ RECOMMENDED (AI Enhancement) ============
+# For professional-grade skin retouching, install AI models:
 
-# For GPU-accelerated upscaling (Real-ESRGAN):
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# pip install basicsr realesrgan
-# Note: If you install basicsr and get "functional_tensor" error, run: python fix_basicsr.py
+# Step 1: Install PyTorch
+# With CUDA (GPU acceleration - recommended):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# CPU only (slower but works everywhere):
+#   pip install torch torchvision
 
-# For AI face restoration (CodeFormer/GFPGAN) - NOT needed for basic beautification:
-# pip install basicsr facexlib gfpgan
+# Step 2: Install GFPGAN for AI face enhancement
+#   pip install gfpgan
+
+# The model weights (~350MB) will auto-download on first use.
+# GPU is recommended for real-time performance!
+
+# ============ OPTIONAL (Advanced upscaling) ============
+# For AI-powered image upscaling:
+#   pip install basicsr realesrgan
+#
+# Note: If you get "functional_tensor" error after installing basicsr:
+#   python fix_basicsr.py
