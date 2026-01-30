@@ -1,0 +1,24 @@
+# LuminaRetouch Dependencies
+# Portrait beautification app - NO external AI models required for core features!
+
+# ============ REQUIRED (Core functionality) ============
+
+# UI Framework
+PySide6>=6.5.0
+
+# Image Processing
+numpy==1.26.4
+opencv-python==4.10.0.84
+
+# Face Detection & Landmarks (auto-downloads lightweight models)
+mediapipe==0.10.21
+
+# ============ OPTIONAL (Advanced features) ============
+
+# For GPU-accelerated upscaling (Real-ESRGAN):
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# pip install basicsr realesrgan
+# Note: If you install basicsr and get "functional_tensor" error, run: python fix_basicsr.py
+
+# For AI face restoration (CodeFormer/GFPGAN) - NOT needed for basic beautification:
+# pip install basicsr facexlib gfpgan
